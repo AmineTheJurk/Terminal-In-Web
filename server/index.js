@@ -11,7 +11,9 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+// Read and trim ADMIN_TOKEN to avoid accidental whitespace issues
+const ADMIN_TOKEN_RAW = process.env.ADMIN_TOKEN || '';
+const ADMIN_TOKEN = String(ADMIN_TOKEN_RAW).trim();
 const SHELL = process.env.SHELL || (os.platform() === 'win32' ? 'powershell.exe' : 'bash');
 
 // simple in-memory session store: sid -> { expires }
@@ -25,9 +27,20 @@ app.use('/assets', express.static(path.join(__dirname, '..', 'assets')));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+function maskSecret(s) {
+  if (!s) return '<empty>';
+  const str = String(s);
+  if (str.length <= 4) return '****';
+  return str.slice(0,2) + '...' + str.slice(-2);
+}
+
 // Login endpoint: accepts token via form POST and sets an HttpOnly session cookie
 app.post('/login', (req, res) => {
-  const token = (req.body && req.body.token) ? String(req.body.token) : '';
+  const tokenRaw = (req.body && req.body.token) ? String(req.body.token) : '';
+  const token = tokenRaw.trim();
+
+  console.log(`Login attempt token=${maskSecret(token)} admin=${maskSecret(ADMIN_TOKEN)}`);
+
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
     return res.status(401).send('invalid');
   }
@@ -86,8 +99,10 @@ function parseCookies(header) {
 wss.on('connection', function connection(ws, req) {
   // Attempt token auth via query param first (backwards compatible)
   const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
-  const token = params.get('token') || '';
-  if (ADMIN_TOKEN && token === ADMIN_TOKEN) {
+  const tokenParam = (params.get('token') || '').trim();
+
+  if (ADMIN_TOKEN && tokenParam === ADMIN_TOKEN) {
+    console.log(`WS auth via query token=${maskSecret(tokenParam)}`);
     return startPtyForConnection(ws);
   }
 
@@ -95,6 +110,7 @@ wss.on('connection', function connection(ws, req) {
   const cookies = parseCookies(req.headers.cookie || '');
   const sid = cookies.sid;
   if (!sid) {
+    console.log('WS auth failed: no sid cookie');
     ws.send(JSON.stringify({ type: 'error', message: 'invalid token or session' }));
     ws.close();
     return;
@@ -103,6 +119,7 @@ wss.on('connection', function connection(ws, req) {
   const sess = SESSIONS.get(sid);
   if (!sess || sess.expires < Date.now()) {
     if (sess) SESSIONS.delete(sid);
+    console.log('WS auth failed: invalid or expired session sid=' + maskSecret(sid));
     ws.send(JSON.stringify({ type: 'error', message: 'invalid token or session' }));
     ws.close();
     return;

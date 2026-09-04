@@ -42,24 +42,42 @@ app.get('/workspaces/:id/download', (req, res) => {
   res.download(full, asName);
 });
 
+const USERNAME_TIMEOUT_MS = 30_000; // 30 seconds to send a valid username JSON
+
 wss.on('connection', function connection(ws, req) {
   // Ask the client for a username. The client should reply with JSON { type: 'username', username: '...' }
   ws.send(JSON.stringify({ type: 'request-username', prompt: 'Enter username:' }));
 
+  // Helper to ignore non-JSON or irrelevant messages while waiting for the explicit username
+  function safeParseJson(msg) {
+    try { return JSON.parse(msg); } catch (e) { return null; }
+  }
+
+  // Set a timeout to close idle connections that never send a proper username JSON
+  const usernameTimer = setTimeout(() => {
+    console.log('Closing connection: no valid username received in time.');
+    try { ws.send(JSON.stringify({ type: 'error', message: 'no username provided' })); } catch (e) {}
+    try { ws.close(); } catch (e) {}
+  }, USERNAME_TIMEOUT_MS);
+
   // Wait for the username message once, then create a workspace and spawn the shell
   const usernameListener = (message) => {
-    let parsed = null;
-    try { parsed = JSON.parse(message); } catch (e) { /* not JSON */ }
+    const parsed = safeParseJson(message);
 
-    let usernameRaw = '';
-    if (parsed && parsed.type === 'username' && parsed.username) {
-      usernameRaw = String(parsed.username);
-    } else {
-      usernameRaw = String(message).trim();
+    // only accept explicit JSON { type: 'username', username: '...' }
+    if (!parsed || parsed.type !== 'username' || !parsed.username) {
+      // ignore anything else (no workspace creation)
+      // log for diagnostics (do not log full message to avoid PII)
+      console.log('Ignored non-username message while awaiting username.');
+      return;
     }
 
+    // got a valid username object; clear the timeout
+    clearTimeout(usernameTimer);
+
+    const usernameRaw = String(parsed.username);
     // sanitize username: allow letters, numbers, dash, underscore; fallback to guest
-    let username = usernameRaw.replace(/[^A-Za-z0-9_-]/g, '') || 'guest';
+    const username = usernameRaw.replace(/[^A-Za-z0-9_-]/g, '') || 'guest';
 
     // create a unique workspace directory for this connection
     const id = crypto.randomBytes(6).toString('hex');
@@ -76,7 +94,7 @@ wss.on('connection', function connection(ws, req) {
     try {
       fs.mkdirSync(path.join(workspaceDir, 'Downloads'), { recursive: true, mode: 0o700 });
 
-      const script = `#!/bin/sh\n# downloadfile: server-assisted download helper\n# usage: downloadfile <file> [-o output]\nOUT=\"\"\nFILE=\"\"\nif [ \"$1\" = \"\" ]; then echo \"usage: downloadfile <file> [-o output]\"; exit 1; fi\nFILE="$1"\nshift\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -o) shift; OUT=\"$1\"; shift; ;\n    *) shift; ;\n  esac\ndone\nif [ ! -f \"$FILE\" ]; then echo \"file not found: $FILE\"; exit 2; fi\nif [ -z \"$OUT\" ]; then OUT=\"$(basename \"$FILE\")\"; fi\n# copy to workspace Downloads for convenience\nmkdir -p \"$HOME/Downloads\"\ncp -- \"$FILE\" \"$HOME/Downloads/$OUT\"\n# print special marker for the browser client to trigger download: __DOWNLOAD__:<relpath>:<outname>\nREL=$(realpath --relative-to \"$HOME\" \"$FILE\")\n# if realpath not available, fallback to basename\nif [ -z \"$REL\" ]; then REL=$(basename \"$FILE\"); fi\necho "__DOWNLOAD__:$REL:$OUT"\n`;
+      const script = `#!/bin/sh\n# downloadfile: server-assisted download helper\n# usage: downloadfile <file> [-o output]\nOUT=\"\"\nFILE=\"\"\nif [ \"$1\" = \"\" ]; then echo \"usage: downloadfile <file> [-o output]\"; exit 1; fi\nFILE=\"$1\"\nshift\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -o) shift; OUT=\"$1\"; shift; ;\n    *) shift; ;\n  esac\ndone\nif [ ! -f \"$FILE\" ]; then echo \"file not found: $FILE\"; exit 2; fi\nif [ -z \"$OUT\" ]; then OUT=\"$(basename \"$FILE\")\"; fi\n# copy to workspace Downloads for convenience\nmkdir -p \"$HOME/Downloads\"\ncp -- \"$FILE\" \"$HOME/Downloads/$OUT\"\n# print special marker for the browser client to trigger download: __DOWNLOAD__:<relpath>:<outname>\nREL=$(realpath --relative-to \"$HOME\" \"$FILE\" 2>/dev/null)\n# if realpath not available or fails, fallback to basename\nif [ -z \"$REL\" ]; then REL=$(basename \"$FILE\"); fi\necho \"__DOWNLOAD__:$REL:$OUT\"\n`;
       fs.writeFileSync(path.join(workspaceDir, 'downloadfile'), script, { mode: 0o755 });
     } catch (e) {
       // ignore script creation errors
@@ -94,6 +112,11 @@ wss.on('connection', function connection(ws, req) {
   };
 
   ws.on('message', usernameListener);
+
+  // Ensure the usernameTimer is cleared if the socket closes before a username is provided
+  ws.on('close', () => {
+    clearTimeout(usernameTimer);
+  });
 });
 
 function startPtyForConnection(ws, cwd, username, workspaceId) {

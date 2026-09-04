@@ -1,0 +1,84 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Terminal-In-Web (CRT)</title>
+    <link rel="stylesheet" href="https://unpkg.com/xterm/css/xterm.css" />
+    <style>
+      html,body { height:100%; margin:0; background:#2b2b2b; }
+      .screen-wrapper {
+        position:relative;
+        width:700px;
+        margin:24px auto;
+      }
+      .crt-image { display:block; width:100%; height:auto; }
+      /* terminal container — adjust left/top/width/height to align with the matrix area of your image */
+      #terminal {
+        position:absolute;
+        left: 7.5%; /* tweak these values to fit your image */
+        top: 6%;
+        width:85%;
+        height:78%;
+        pointer-events:auto;
+      }
+      /* optional small note */
+      .note { text-align:center; color:#9f9; font-family:monospace; margin-top:8px }
+    </style>
+  </head>
+  <body>
+    <div class="screen-wrapper">
+      <img class="crt-image" src="/assets/screen.png" alt="CRT screen" />
+      <div id="terminal"></div>
+    </div>
+    <div class="note">Provide ?token=YOUR_TOKEN in the URL. Example: /?token=changeme</div>
+
+    <script src="https://unpkg.com/xterm/lib/xterm.js"></script>
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const token = params.get('token') || '';
+      if (!token) {
+        document.getElementsByClassName('note')[0].textContent = 'No token provided. Append ?token=YOUR_TOKEN to the URL.';
+      }
+
+      const term = new window.Terminal({ cols: 80, rows: 24, cursorBlink: true });
+      term.open(document.getElementById('terminal'));
+
+      const protocol = (location.protocol === 'https:') ? 'wss' : 'ws';
+      const wsUrl = `${protocol}://${location.host}/?token=${encodeURIComponent(token)}`;
+      const ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        // handshake: nothing for now
+        term.write('Connected to server.\r\n');
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'output') term.write(msg.data);
+          if (msg.type === 'error') term.write('\r\nERROR: ' + msg.message + '\r\n');
+        } catch (e) {
+          // not JSON — print raw
+          term.write(ev.data);
+        }
+      };
+
+      ws.onclose = () => term.write('\r\n*** disconnected ***');
+
+      term.onData(data => {
+        // send raw data directly
+        ws.send(data);
+      });
+
+      function sendResize() {
+        const cols = term.cols;
+        const rows = term.rows;
+        ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+      }
+
+      window.addEventListener('resize', () => { setTimeout(sendResize, 200); });
+      setTimeout(sendResize, 200);
+    </script>
+  </body>
+</html>

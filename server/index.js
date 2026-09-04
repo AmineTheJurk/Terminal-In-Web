@@ -131,7 +131,18 @@ function startPtyForConnection(ws, cwd, username, workspaceId) {
     PS1: `${username}@${os.hostname()}:~$ `
   });
 
-  const term = pty.spawn(SHELL, ['-i'], {
+  // Build shell args that force a PS1 that shows ~ as home regardless of shell startup files
+  const shellBase = path.basename(SHELL || '');
+  let spawnArgs = ['-i'];
+  if (['bash', 'sh', 'zsh'].includes(shellBase)) {
+    // Escape single quotes in PS1
+    const ps1 = `${username}@${os.hostname()}:~$ `;
+    const safePS1 = ps1.replace(/'/g, "'\"'\"");
+    // Use -c to set PS1 and then exec an interactive shell so PS1 is enforced
+    spawnArgs = ['-c', `export PS1='${safePS1}'; export HOME='${cwd}'; cd '${cwd}'; exec ${SHELL} -i`];
+  }
+
+  const term = pty.spawn(SHELL, spawnArgs, {
     name: 'xterm-color',
     cols: cols,
     rows: rows,

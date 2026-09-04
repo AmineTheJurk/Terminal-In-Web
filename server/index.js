@@ -17,10 +17,30 @@ const SHELL = process.env.SHELL || (os.platform() === 'win32' ? 'powershell.exe'
 const WORKSPACES_BASE = path.join(os.tmpdir(), 'terminal-workspaces');
 try { fs.mkdirSync(WORKSPACES_BASE, { recursive: true }); } catch (e) { /* ignore */ }
 
+// Map workspace id -> full path
+const WORKSPACES = new Map();
+
 app.use(express.static(path.join(__dirname, '..', 'client')));
 app.use('/assets', express.static(path.join(__dirname, '..', 'assets')));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Download endpoint for files inside a workspace
+app.get('/workspaces/:id/download', (req, res) => {
+  const id = req.params.id;
+  const workspace = WORKSPACES.get(id);
+  if (!workspace) return res.status(404).send('workspace not found');
+
+  const rel = req.query.file || req.query.path || '';
+  // normalize and prevent path traversal
+  const decoded = path.normalize(rel).replace(/^([\.\/\\])+/, '');
+  const full = path.join(workspace, decoded);
+  if (!full.startsWith(workspace)) return res.status(400).send('invalid path');
+  if (!fs.existsSync(full)) return res.status(404).send('file not found');
+
+  const asName = req.query.as || path.basename(full);
+  res.download(full, asName);
+});
 
 wss.on('connection', function connection(ws, req) {
   // Ask the client for a username. The client should reply with JSON { type: 'username', username: '...' }
@@ -42,7 +62,7 @@ wss.on('connection', function connection(ws, req) {
     let username = usernameRaw.replace(/[^A-Za-z0-9_-]/g, '') || 'guest';
 
     // create a unique workspace directory for this connection
-    const id = crypto.randomBytes(4).toString('hex');
+    const id = crypto.randomBytes(6).toString('hex');
     const workspaceDir = path.join(WORKSPACES_BASE, `${username}-${id}`);
     try {
       fs.mkdirSync(workspaceDir, { recursive: true, mode: 0o700 });
@@ -52,18 +72,31 @@ wss.on('connection', function connection(ws, req) {
       return;
     }
 
-    // acknowledge and proceed
-    ws.send(JSON.stringify({ type: 'info', message: `Workspace created: ~/${username}-${id}` }));
+    // create Downloads dir and a helper script `downloadfile`
+    try {
+      fs.mkdirSync(path.join(workspaceDir, 'Downloads'), { recursive: true, mode: 0o700 });
+
+      const script = `#!/bin/sh\n# downloadfile: server-assisted download helper\n# usage: downloadfile <file> [-o output]\nOUT=\"\"\nFILE=\"\"\nif [ \"$1\" = \"\" ]; then echo \"usage: downloadfile <file> [-o output]\"; exit 1; fi\nFILE="$1"\nshift\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -o) shift; OUT=\"$1\"; shift; ;\n    *) shift; ;\n  esac\ndone\nif [ ! -f \"$FILE\" ]; then echo \"file not found: $FILE\"; exit 2; fi\nif [ -z \"$OUT\" ]; then OUT=\"$(basename \"$FILE\")\"; fi\n# copy to workspace Downloads for convenience\nmkdir -p \"$HOME/Downloads\"\ncp -- \"$FILE\" \"$HOME/Downloads/$OUT\"\n# print special marker for the browser client to trigger download: __DOWNLOAD__:<relpath>:<outname>\nREL=$(realpath --relative-to \"$HOME\" \"$FILE\")\n# if realpath not available, fallback to basename\nif [ -z \"$REL\" ]; then REL=$(basename \"$FILE\"); fi\necho "__DOWNLOAD__:$REL:$OUT"\n`;
+      fs.writeFileSync(path.join(workspaceDir, 'downloadfile'), script, { mode: 0o755 });
+    } catch (e) {
+      // ignore script creation errors
+    }
+
+    // register workspace id -> path
+    WORKSPACES.set(id, workspaceDir);
+
+    // acknowledge and proceed (send workspace id back explicitly)
+    ws.send(JSON.stringify({ type: 'ready', id: id, name: `${username}-${id}`, message: `Workspace created: ~/${username}-${id}` }));
 
     // remove this listener and start the pty session rooted at the workspace
     ws.removeListener('message', usernameListener);
-    startPtyForConnection(ws, workspaceDir, username);
+    startPtyForConnection(ws, workspaceDir, username, id);
   };
 
   ws.on('message', usernameListener);
 });
 
-function startPtyForConnection(ws, cwd, username) {
+function startPtyForConnection(ws, cwd, username, workspaceId) {
   // spawn a shell for each connection with cwd set to the workspace
   const cols = 80;
   const rows = 24;
@@ -118,7 +151,9 @@ function startPtyForConnection(ws, cwd, username) {
 
   ws.on('close', function() {
     try { term.kill(); } catch (e) {}
-    // optionally: remove the workspace directory when session ends
+    // remove the workspace mapping; keep files by default but remove mapping
+    try { WORKSPACES.delete(workspaceId); } catch (e) {}
+    // optional: remove the workspace directory when session ends
     // fs.rmSync(cwd, { recursive: true, force: true });
   });
 }

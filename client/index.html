@@ -45,6 +45,11 @@
         font-family: monospace;
       }
       .note { position: absolute; bottom: 8px; width: 100%; text-align:center; color:#9f9; font-family:monospace; }
+      /* SSH button */
+      #sshBtn { position: absolute; right: 12px; top: 12px; z-index: 40; padding:8px 10px; background:#222; color:#9f9; border:1px solid #3a3; border-radius:4px; cursor:pointer }
+      .modal { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); background: #111; border: 1px solid #333; padding: 16px; color:#9f9; font-family: monospace; border-radius:6px; z-index:50; width: min(720px, 92vw); display:none }
+      .modal pre { background:#000; padding:8px; border:1px solid #222; color:#9f9; overflow:auto }
+      .modal .close { float:right; cursor:pointer; color:#f66 }
     </style>
   </head>
   <body>
@@ -63,6 +68,23 @@
         </div>
       </div>
 
+      <button id="sshBtn">SSH</button>
+
+      <div id="sshModal" class="modal" role="dialog" aria-hidden="true">
+        <div><span class="close" id="closeModal">✖</span><h3>SSH & Download instructions</h3></div>
+        <p>Direct SSH to the container is not provided. Use the web terminal above for interactive access.
+        To download files from your workspace to your local machine, use the <code>downloadfile</code> helper inside the web shell, or use the HTTP endpoint shown below.</p>
+        <h4>Using the in-shell helper</h4>
+        <pre>
+# In the web terminal run:
+downloadfile path/to/file -o myfile.txt
+# This copies the file to your workspace ~/Downloads and signals the browser to download it.
+        </pre>
+        <h4>Download via curl (from your local machine or SSH session)</h4>
+        <pre id="curlCmd">curl -o ~/Downloads/FILE_NAME "https://YOUR_SERVICE/workspaces/WORKSPACE_ID/download?file=REL_PATH"</pre>
+        <p>Replace WORKSPACE_ID and REL_PATH with the values shown in the terminal when your workspace starts (you can also copy them from the web terminal message).</p>
+      </div>
+
     </div>
     <div class="note">This session runs inside an isolated workspace folder; it will not use your project files.</div>
 
@@ -75,6 +97,7 @@
       const ws = new WebSocket(`${protocol}://${location.host}`);
 
       let authenticated = false;
+      let workspaceId = null;
 
       ws.onopen = () => { /* waiting for server request */ };
 
@@ -97,16 +120,66 @@
             return;
           }
 
-          if (msg.type === 'info') {
+          if (msg.type === 'ready') {
             // hide overlay when workspace created
             document.getElementById('userOverlay').style.display = 'none';
             authenticated = true;
+            workspaceId = msg.id || null;
+            term.write(msg.message + '\r\n');
+
+            // update curl example in SSH modal
+            const curlEl = document.getElementById('curlCmd');
+            const host = location.origin.replace(/^http/, 'https');
+            const serviceUrl = location.origin;
+            if (workspaceId) {
+              const sample = `curl -o ~/Downloads/FILE_NAME "${serviceUrl}/workspaces/${workspaceId}/download?file=REL_PATH"`;
+              curlEl.textContent = sample;
+            }
+
+            return;
+          }
+
+          if (msg.type === 'info') {
             term.write(msg.message + '\r\n');
             return;
           }
 
           if (msg.type === 'output') {
-            term.write(msg.data);
+            // before printing, scan for download markers: __DOWNLOAD__:<relpath>:<outname>
+            const data = msg.data.toString();
+            const regex = /__DOWNLOAD__:(.+?):(.+?)(?:\r?\n|$)/g;
+            let lastIndex = 0;
+            let m;
+            while ((m = regex.exec(data)) !== null) {
+              const before = data.slice(lastIndex, m.index);
+              if (before) term.write(before);
+              lastIndex = regex.lastIndex;
+              const relpath = m[1];
+              const outname = m[2];
+              // trigger browser download from workspace endpoint
+              if (workspaceId) {
+                try {
+                  const url = `${location.origin}/workspaces/${workspaceId}/download?file=${encodeURIComponent(relpath)}&as=${encodeURIComponent(outname)}`;
+                  fetch(url).then(async (res) => {
+                    if (!res.ok) { term.write('\r\nDownload failed: ' + res.status + '\r\n'); return; }
+                    const blob = await res.blob();
+                    const a = document.createElement('a');
+                    const href = URL.createObjectURL(blob);
+                    a.href = href;
+                    a.download = outname;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    URL.revokeObjectURL(href);
+                    term.write(`\r\nDownloaded ${outname}\r\n`);
+                  }).catch((e) => { term.write('\r\nDownload error: ' + e.message + '\r\n'); });
+                } catch (e) { term.write('\r\nDownload error: ' + e.message + '\r\n'); }
+              } else {
+                term.write('\r\nNo workspace ID available for download\r\n');
+              }
+            }
+            const rest = data.slice(lastIndex);
+            if (rest) term.write(rest);
             return;
           }
 
@@ -130,6 +203,13 @@
       function sendResize() { const cols = term.cols; const rows = term.rows; ws.send(JSON.stringify({ type: 'resize', cols, rows })); }
       window.addEventListener('resize', () => { setTimeout(sendResize, 200); });
       setTimeout(sendResize, 200);
+
+      // SSH modal handlers
+      const sshBtn = document.getElementById('sshBtn');
+      const sshModal = document.getElementById('sshModal');
+      const closeModal = document.getElementById('closeModal');
+      sshBtn.addEventListener('click', () => { sshModal.style.display = 'block'; });
+      closeModal.addEventListener('click', () => { sshModal.style.display = 'none'; });
     </script>
   </body>
 </html>
